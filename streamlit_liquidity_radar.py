@@ -1,5 +1,5 @@
-# streamlit_liquidity_radar.py (v6-cloud+)
-# 雲端容錯：輪替 fapi 網域；取不到 24h 時自動降級（白名單 + 近1h/taker/OI 照跑）
+# streamlit_liquidity_radar.py  —  Worker 版（最終）
+# 功能：統一排序 + 方向優先 + 多人快取 + 雲端容錯 + 透過 Cloudflare Worker 代理 Binance
 # 依賴：streamlit pandas requests python-dateutil numpy
 
 import time, random
@@ -10,21 +10,25 @@ from datetime import datetime
 from dateutil import tz
 import streamlit as st
 
-# -------- 常量 / 設定 --------
-FAPI_BASES = ["https://fapi.binance.com", "https://fapi1.binance.com", "https://fapi2.binance.com"]
-DATA_BASE = "https://www.binance.com"  # takerlongshortRatio, openInterestHist
-TZ_LOCAL = tz.gettz("Asia/Taipei")
+# ===================== 必改：把這行換成你的 Workers 網址 =====================
+WORKER_BASE = "https://binance-proxy.tonytien1980.workers.dev/"   # 例： https://binance-proxy-xxxxx.workers.dev
+# =============================================================================
+
+# 透過 Worker 走 fapi 與 /futures/data/ 端點
+FAPI_BASES = [WORKER_BASE]         # 我們統一打到 Worker，讓 Worker 轉發並快取
+DATA_BASE  = WORKER_BASE
 UA = {"User-Agent": "liquidity-radar/streamlit-1.0"}
 
-# 當 fapi 完全取不到 24h 成交額時，用這些白名單維持功能可用（20 檔）
+# 若 fapi 24h/klines 暫時不可用，改用白名單維持功能（20 檔）
 FALLBACK_SYMBOLS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","LINKUSDT","LTCUSDT","TRXUSDT",
     "BCHUSDT","DOTUSDT","AVAXUSDT","MATICUSDT","UNIUSDT","ATOMUSDT","FILUSDT","APTUSDT","SUIUSDT","NEARUSDT"
 ]
 
+TZ_LOCAL = tz.gettz("Asia/Taipei")
 st.set_page_config(page_title="USDTⓈ-M 流動性雷達（5m）", layout="wide")
 
-# -------- 色帶工具（無需 matplotlib） --------
+# ---------- 色帶工具（無需 matplotlib） ----------
 def _hex(rgb): return "#{:02x}{:02x}{:02x}".format(*rgb)
 def _interp(c1, c2, t): return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
 def _norm_series(s: pd.Series):
@@ -48,15 +52,19 @@ COLORS = {
     "vol": ((232, 245, 233), (27, 94, 32)),      # 綠（成交額）
 }
 
-# -------- HTTP + 快取（多人友善：ttl=120，帶抖動） --------
+# ---------- HTTP + 快取（多人友善：ttl=120，帶抖動與容錯） ----------
 @st.cache_data(ttl=120)
 def http_get_json(url, params=None, timeout=12, tries=3, sleep_between=0.6):
+    """一般 GET，回傳 json；失敗會 raise。"""
     time.sleep(random.uniform(0.05, 0.15))  # 避免同秒齊發
     last_err = None
     for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=UA)
-            r.raise_for_status()
+            # Workers 在 upstream 非 200 時會回 502 + JSON，我們也一起解析
+            if r.status_code != 200:
+                # 若是 Worker 的 JSON 錯誤格式，直接丟例外讓上層降級
+                raise requests.HTTPError(f"status={r.status_code}, body={r.text[:200]}")
             return r.json()
         except Exception as e:
             last_err = e
@@ -66,28 +74,31 @@ def http_get_json(url, params=None, timeout=12, tries=3, sleep_between=0.6):
     if last_err:
         raise last_err
 
-# 專給 /fapi 路徑使用：自動輪替多個 base
 @st.cache_data(ttl=120)
-def fapi_get_json(path, params=None, timeout=12):
-    errs = []
-    for base in FAPI_BASES:
-        url = f"{base}{path}"
-        try:
-            return http_get_json(url, params=params, timeout=timeout)
-        except Exception as e:
-            errs.append(f"{base}: {e}")
-            continue
-    raise RuntimeError("All fapi bases failed: " + " | ".join(errs))
+def fapi_get_json(path, params=None, timeout=12, safe=False):
+    """
+    走 Worker 的 fapi 端點。
+    safe=True：失敗時回 None（不 raise），用於雲端降級。
+    """
+    url = f"{WORKER_BASE}{path}"
+    try:
+        return http_get_json(url, params=params, timeout=timeout)
+    except Exception:
+        if safe:
+            return None
+        raise
 
-# -------- Data sources --------
+# ---------- 資料來源 ----------
 @st.cache_data(ttl=120)
 def try_get_usdtm_tickers_df():
     """
-    取 24h 成交額（可能在雲端被擋）。
-    成功回 df(symbol, quoteVolume24h)；失敗回 None。
+    取 24h 成交額（/fapi/v1/ticker/24hr）。
+    有時雲端會被擋；失敗回 None，不拋錯。
     """
     try:
-        data = fapi_get_json("/fapi/v1/ticker/24hr", params=None, timeout=15)
+        data = fapi_get_json("/fapi/v1/ticker/24hr", params=None, timeout=15, safe=True)
+        if not data:
+            return None
         rows = []
         for d in data:
             sym = d.get("symbol", "")
@@ -95,10 +106,12 @@ def try_get_usdtm_tickers_df():
                 try: qv = float(d.get("quoteVolume", 0.0))
                 except Exception: qv = 0.0
                 rows.append({"symbol": sym, "quoteVolume24h": qv})
+        if not rows:
+            return None
         df = pd.DataFrame(rows).sort_values("quoteVolume24h", ascending=False)
         return df
     except Exception:
-        return None  # 進入降級模式
+        return None
 
 @st.cache_data(ttl=120)
 def get_usdtm_top_symbols(n=20):
@@ -142,8 +155,8 @@ def get_oi_hist(symbol, period="5m", limit=2):
 
 @st.cache_data(ttl=120)
 def get_last_1h_quote_volume(symbol):
-    # 用 5m K 線合計近 1 小時報價成交額；會被 fapi* 輪替保護
-    arr = fapi_get_json("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 12}, timeout=15)
+    # 用 5m K 線合計近 1 小時報價成交額；safe=True 以便雲端被擋時回 NaN
+    arr = fapi_get_json("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 12}, timeout=15, safe=True)
     if not isinstance(arr, list) or len(arr) == 0: return np.nan
     try:
         qvols = [float(k[7]) for k in arr]  # quoteAssetVolume
@@ -151,14 +164,15 @@ def get_last_1h_quote_volume(symbol):
     except Exception:
         return np.nan
 
-# -------- 摘要 --------
+# ---------- 摘要（單一標的） ----------
 def summarize_symbol(symbol, qv24h_map):
     try:
         taker = get_taker_buy_sell(symbol, "5m", 12)
         oi = get_oi_hist(symbol, "5m", 2)
         qv1h = get_last_1h_quote_volume(symbol)
 
-        if taker.empty: return {"symbol": symbol, "error": "no taker data"}
+        if taker.empty:
+            return {"symbol": symbol, "error": "no taker data"}
 
         last = taker.iloc[-1]
         ma = taker[["buyVol", "sellVol", "buySellDiff"]].rolling(6, min_periods=1).mean().iloc[-1]
@@ -195,11 +209,10 @@ def summarize_symbol(symbol, qv24h_map):
     except Exception as e:
         return {"symbol": symbol, "error": str(e)}
 
-# -------- UI --------
+# ---------- UI ----------
 st.title("USDTⓈ-M 流動性雷達（5分鐘）")
-
 now_local = datetime.now(tz=TZ_LOCAL).strftime("%Y-%m-%d %H:%M:%S")
-st.caption(f"台北時間：{now_local}｜多人友善：資料以快取（~120 秒）合併請求。")
+st.caption(f"台北時間：{now_local}｜多人友善：所有資料以 120 秒快取合併請求。")
 
 with st.sidebar:
     st.header("設定")
@@ -217,9 +230,9 @@ with st.sidebar:
 # 取得 TopN（可能降級）
 symbols, qv24h_map, degraded = get_usdtm_top_symbols(top_n)
 if degraded:
-    st.warning("⚠️ 雲端目前無法存取 Binance 24h 成交額端點，已啟用『降級模式』：\n"
+    st.warning("⚠️ 雲端目前無法取得 24h 成交額端點，已啟用『降級模式』：\n"
                "- 使用預設白名單品種作追蹤清單\n"
-               "- 24h 成交額欄位可能顯示空值（NaN）\n"
+               "- 24h 成交額欄位可能為空（NaN）\n"
                "- 近1h 成交額 / 主動買賣 / OI 變化 依然正常，可照統一排序研判熱區與方向", icon="⚠️")
 
 st.write(f"**追蹤標的（{len(symbols)} 檔）**：", ", ".join(symbols))
@@ -233,18 +246,23 @@ if not err_df.empty:
     st.dataframe(err_df, use_container_width=True, height=180)
 
 ok = df[df["error"].isna()].drop(columns=["error"]).copy()
-if hide_no_data:
+# 只有在欄位存在時才 dropna，避免 KeyError
+if "淨主動買量（5m）" in ok.columns and hide_no_data:
     ok = ok.dropna(subset=["淨主動買量（5m）"], how="any")
 
-# -------- 統一排序（與本機一致） --------
+# ---------- 統一排序（與本機一致） ----------
 def unified_sort(df_in: pd.DataFrame):
     if df_in.empty: return df_in
-    if direction_priority == "多方新單優先":
-        pri = df_in[(df_in["淨主動買量（5m）"] > 0) & (df_in["OI 變化%（相對前一根5m）"] >= 0)]
-        rest = df_in.drop(pri.index); blocks = [pri, rest]
-    elif direction_priority == "空方新單優先":
-        pri = df_in[(df_in["淨主動買量（5m）"] < 0) & (df_in["OI 變化%（相對前一根5m）"] >= 0)]
-        rest = df_in.drop(pri.index); blocks = [pri, rest]
+    # 方向優先區塊
+    if ("淨主動買量（5m）" in df_in.columns) and ("OI 變化%（相對前一根5m）" in df_in.columns):
+        if direction_priority == "多方新單優先":
+            pri = df_in[(df_in["淨主動買量（5m）"] > 0) & (df_in["OI 變化%（相對前一根5m）"] >= 0)]
+            rest = df_in.drop(pri.index); blocks = [pri, rest]
+        elif direction_priority == "空方新單優先":
+            pri = df_in[(df_in["淨主動買量（5m）"] < 0) & (df_in["OI 變化%（相對前一根5m）"] >= 0)]
+            rest = df_in.drop(pri.index); blocks = [pri, rest]
+        else:
+            blocks = [df_in]
     else:
         blocks = [df_in]
 
@@ -252,26 +270,30 @@ def unified_sort(df_in: pd.DataFrame):
     for b in blocks:
         if b.empty: outs.append(b); continue
         b = b.copy()
-        b["_absNetBuy"] = b["淨主動買量（5m）"].abs()
-        b.sort_values(
-            by=["近1小時成交額(USDT)", "買量放大量倍數（vs近30m均值）", "_absNetBuy",
-                "OI 變化%（相對前一根5m）", "24h 成交額(USDT)"],
-            ascending=[False, False, False, False, False],
-            inplace=True, na_position="last",
-        )
+        if "淨主動買量（5m）" in b.columns:
+            b["_absNetBuy"] = b["淨主動買量（5m）"].abs()
+        else:
+            b["_absNetBuy"] = np.nan
+        # 缺欄位也不會炸，NaN 會自動排後
+        sort_cols = ["近1小時成交額(USDT)", "買量放大量倍數（vs近30m均值）", "_absNetBuy", "OI 變化%（相對前一根5m）", "24h 成交額(USDT)"]
+        for c in sort_cols:
+            if c not in b.columns: b[c] = np.nan
+        b.sort_values(by=sort_cols, ascending=[False, False, False, False, False], inplace=True, na_position="last")
         b.drop(columns=["_absNetBuy"], inplace=True)
         outs.append(b)
     return pd.concat(outs, axis=0)
 
 ok_sorted = unified_sort(ok)
 
-# -------- 顯示 --------
+# ---------- 顯示 ----------
 TABLE_HEIGHT = 900
 if ok_sorted.empty:
     st.info("目前沒有成功回傳資料的標的。請稍後再試或點『立即更新』。")
 else:
     if view_mode.startswith("簡化"):
         cols = ["symbol","24h 成交額(USDT)","近1小時成交額(USDT)","淨主動買量（5m）","OI 變化%（相對前一根5m）","判讀"]
+        for c in cols:
+            if c not in ok_sorted.columns: ok_sorted[c] = np.nan
         view = ok_sorted[cols].copy()
         def style_simple(df_in: pd.DataFrame):
             styler = df_in.style
@@ -316,4 +338,4 @@ else:
         st.subheader("🧪 進階模式（統一排序）")
         st.dataframe(style_full(view), use_container_width=True, height=TABLE_HEIGHT)
 
-st.caption("資料來源：Binance USDTⓈ-M Futures — 24h ticker（若被擋則降級）、5m kline（近1h）、takerlongshortRatio（5m）、openInterestHist（5m）。時區：台北。")
+st.caption("資料來源：Binance USDTⓈ-M Futures（透過 Cloudflare Worker 代理與快取 120s）。時區：台北。")
